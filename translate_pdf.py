@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import html
 import http.client
 import json
 import logging
@@ -678,6 +679,50 @@ def prepare_translations(
     return translated
 
 
+TEXT_ALIGN_NAMES = {0: "left", 1: "center", 2: "right"}
+FONT_ARCHIVES: dict[str, fitz.Archive] = {}
+# MuPDF 自带的回退字体没有 U+02C6（数学里的帽子 ˆ），逐字回退时会写出空框。
+# 这类字符换成人人都有的等价字形；译文缓存里保留原字符，只影响打印效果。
+RENDER_SUBSTITUTIONS = str.maketrans({"ˆ": "^"})
+
+
+def font_archive(fontfile: str) -> fitz.Archive:
+    """@font-face 的 src 只能相对 Archive 解析，按目录缓存一个即可。"""
+    directory = str(Path(fontfile).parent)
+    if directory not in FONT_ARCHIVES:
+        FONT_ARCHIVES[directory] = fitz.Archive(directory)
+    return FONT_ARCHIVES[directory]
+
+
+def html_css(fontfile: str, size: float, color: tuple[float, float, float], align: int) -> str:
+    red, green, blue = (max(0, min(255, round(value * 255))) for value in color)
+    return (
+        f"* {{font-family:'cjkfont'; font-size:{size:.2f}px; line-height:1.12;"
+        f" text-align:{TEXT_ALIGN_NAMES.get(align, 'left')}; color:#{red:02x}{green:02x}{blue:02x};}}"
+        f" @font-face {{font-family:'cjkfont'; src:url('{Path(fontfile).name}');}}"
+    )
+
+
+def insert_html(
+    page: fitz.Page,
+    target: fitz.Rect,
+    text: str,
+    *,
+    fontfile: str,
+    size: float,
+    color: tuple[float, float, float],
+    align: int,
+    scale_low: float,
+) -> tuple[float, float]:
+    return page.insert_htmlbox(
+        target,
+        html.escape(text.translate(RENDER_SUBSTITUTIONS)),
+        css=html_css(fontfile, size, color, align),
+        archive=font_archive(fontfile),
+        scale_low=scale_low,
+    )
+
+
 def insert_fitted_text(
     page: fitz.Page,
     rect: fitz.Rect,
@@ -688,39 +733,24 @@ def insert_fitted_text(
     color: tuple[float, float, float],
     align: int,
 ) -> float:
-    """Shrink translated text until it fits inside its original text block."""
+    """Shrink translated text until it fits inside its original text block.
+
+    这里走 HTML 渲染而不是 insert_textbox：中文字体普遍没有 ℓ、∆、∗ 这类
+    数学符号，insert_textbox 只会写出缺字形空框，而 MuPDF 的 HTML 引擎会
+    逐字回退到自带字体，符号和中文字都留得住。
+    """
     inset = min(1.2, max(0.2, font_size * 0.06))
     target = fitz.Rect(rect.x0 + inset, rect.y0 + inset, rect.x1 - inset, rect.y1 - inset)
     if target.width <= 2 or target.height <= 2:
         target = fitz.Rect(rect)
     size = max(4.0, font_size * 0.96)
-    while size >= 4.0:
-        result = page.insert_textbox(
-            target,
-            text,
-            fontfile=fontfile,
-            fontname="cjkfont",
-            fontsize=size,
-            color=color,
-            align=align,
-            lineheight=1.12,
-            overlay=True,
-        )
-        if result >= 0:
-            return size
-        size -= 0.5
-    LOGGER.warning("文本块无法完全装入原区域，将以 4pt 字号尽量写入: %s", text[:80])
-    page.insert_textbox(
-        target,
-        text,
-        fontfile=fontfile,
-        fontname="cjkfont",
-        fontsize=4.0,
-        color=color,
-        align=align,
-        lineheight=1.05,
-        overlay=True,
+    spare, scale = insert_html(
+        page, target, text, fontfile=fontfile, size=size, color=color, align=align, scale_low=4.0 / size
     )
+    if spare >= 0:
+        return size * scale
+    LOGGER.warning("文本块无法完全装入原区域，将以 4pt 字号尽量写入: %s", text[:80])
+    insert_html(page, target, text, fontfile=fontfile, size=4.0, color=color, align=align, scale_low=0.1)
     return 4.0
 
 

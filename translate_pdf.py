@@ -15,6 +15,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -80,6 +81,63 @@ def clean_extracted_text(text: str) -> str:
     return " ".join(line for line in lines if line).strip()
 
 
+def is_script_span(span: dict[str, Any], base_size: float) -> bool:
+    """上下标碎片：PyMuPDF 标了上标（flags 的 bit0），或字号明显小于正文。"""
+    if int(span.get("flags", 0)) & 1:
+        return True
+    return float(span.get("size", base_size)) < base_size * 0.85
+
+
+def dominant_font_size(spans: list[dict[str, Any]]) -> float:
+    sizes = Counter(round(float(span.get("size", 10.0)) * 2) / 2 for span in spans)
+    return sizes.most_common(1)[0][0] if sizes else 10.0
+
+
+def line_text(spans: list[dict[str, Any]], base_size: float) -> str:
+    """一行内的 span 拼接：有明显水平间距就补空格，但上下标碎片之间不补。
+
+    这些 PDF 里很多空格不是空格字符、只是位置间隔，直接拼接会把单词粘成
+    "DisaggregatedLLMinference"；反过来公式里的上下标又不能被塞进空格。
+    """
+    text = ""
+    previous: dict[str, Any] | None = None
+    for span in spans:
+        piece = str(span.get("text", ""))
+        if not piece:
+            continue
+        if previous is not None:
+            gap = float(span["bbox"][0]) - float(previous["bbox"][2])
+            size = min(float(span.get("size", base_size)), float(previous.get("size", base_size)))
+            if (
+                gap > 0.25 * size
+                and not text.endswith(" ")
+                and not piece.startswith(" ")
+                and not is_script_span(span, base_size)
+                and not is_script_span(previous, base_size)
+            ):
+                text += " "
+        text += piece
+        previous = span
+    return text
+
+
+def block_source_text(lines: list[dict[str, Any]], base_size: float) -> str:
+    """块内多"行"拼接：下一行开头是上下标碎片时直接接上，不插空格。
+
+    公式被 Pdf 切成多个"行"（如 "1 + nτ" / "inflight(p)"）时会走到这里。
+    """
+    parts: list[str] = []
+    for line in lines:
+        spans = [span for span in line.get("spans", []) if str(span.get("text", ""))]
+        if not spans:
+            continue
+        text = line_text(spans, base_size)
+        if parts and not is_script_span(spans[0], base_size):
+            text = " " + text
+        parts.append(text)
+    return clean_extracted_text("".join(parts))
+
+
 def is_translatable(text: str) -> bool:
     """Skip blocks that are clearly only punctuation, numbers, or symbols."""
     if len(text.strip()) < 2 or not re.search(r"[A-Za-z\u3400-\u9fff]", text):
@@ -129,8 +187,7 @@ def iter_text_blocks(doc: fitz.Document, selected_pages: set[int] | None = None)
                 continue
             lines = block.get("lines", [])
             spans = [span for line in lines for span in line.get("spans", []) if span.get("text", "").strip()]
-            raw_text = "\n".join("".join(span.get("text", "") for span in line.get("spans", [])) for line in lines)
-            source_text = clean_extracted_text(raw_text)
+            source_text = block_source_text(lines, dominant_font_size(spans))
             if not source_text:
                 continue
             rect = fitz.Rect(block["bbox"])

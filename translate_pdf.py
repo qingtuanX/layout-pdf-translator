@@ -61,6 +61,7 @@ class TextBlock:
     color: tuple[float, float, float]
     bold: bool
     align: int
+    math_ratio: float = 0.0
 
     @property
     def block_id(self) -> str:
@@ -140,7 +141,297 @@ def iter_text_blocks(doc: fitz.Document, selected_pages: set[int] | None = None)
                 color=colors[0] if colors else (0.0, 0.0, 0.0),
                 bold=any("bold" in str(span.get("font", "")).lower() for span in spans),
                 align=block_alignment(rect, page.rect),
+                math_ratio=math_char_ratio(spans),
             )
+
+
+TABLE_CAPTION_RE = re.compile(r"^\s*(?:TABLE|Table)\s+[IVXLC0-9]+\s*[:.]")
+MATH_FONT_MARKERS = (
+    "CMMI",
+    "CMSY",
+    "CMEX",
+    "CMSL",
+    "CMBX",
+    "MSAM",
+    "EUSM",
+    "EUFM",
+    "Math",
+    "Symbol",
+    "MTMI",
+    "MTSY",
+    "STIX",
+    "XITS",
+)
+MATH_SYMBOL_RE = re.compile(r"[=+\-−×·÷^_∑∫√≤≥≠≈∈∀∃∂⟨⟩⊗→←]")
+RULE_MIN_WIDTH = 20.0
+RULE_MAX_HEIGHT = 3.0
+TABLE_MIN_WIDTH = 100.0
+RULE_GAP = 120.0
+RULE_OVERLAP = 0.6
+MATH_CLUSTER_GAP = 14.0
+REGION_MARGIN = 3.0
+REGION_COVERAGE = 0.5
+
+
+@dataclass(frozen=True)
+class PreservedRegion:
+    """一块保持原始排版的页面区域：截图贴回，而不是重排译文。"""
+
+    page_index: int
+    rect: tuple[float, float, float, float]
+    kind: str  # "table" | "formula"
+    label: str
+
+    def as_rect(self) -> fitz.Rect:
+        return fitz.Rect(self.rect)
+
+
+def math_char_ratio(spans: list[dict[str, Any]]) -> float:
+    """数学字体（Computer Modern 系列等）字符占该块的比例。"""
+    total = 0
+    math_chars = 0
+    for span in spans:
+        text = str(span.get("text", "")).strip()
+        if not text:
+            continue
+        total += len(text)
+        font = str(span.get("font", ""))
+        if any(marker in font for marker in MATH_FONT_MARKERS):
+            math_chars += len(text)
+    return math_chars / total if total else 0.0
+
+
+def is_math_block(block: TextBlock) -> bool:
+    """判断一个块是不是（基本）只由公式构成。散文段落一律排除。"""
+    text = block.source_text
+    words = re.findall(r"[A-Za-z]{2,}", text)
+    if len(text) > 160 or len(words) >= 8:
+        return False
+    if block.math_ratio >= 0.3:
+        return True
+    return len(words) <= 2 and len(text) <= 60 and block.math_ratio >= 0.1 and bool(MATH_SYMBOL_RE.search(text))
+
+
+def horizontal_rules(page: fitz.Page) -> list[fitz.Rect]:
+    """表格的水平线（booktabs 的 toprule/midrule/bottomrule 等）。"""
+    rules: list[fitz.Rect] = []
+    for drawing in page.get_drawings():
+        rect = fitz.Rect(drawing["rect"])
+        if rect.height <= RULE_MAX_HEIGHT and rect.width >= RULE_MIN_WIDTH:
+            rules.append(rect)
+    return sorted(rules, key=lambda rect: (rect.y0, rect.x0))
+
+
+def horizontal_overlap_ratio(a: fitz.Rect, b: fitz.Rect) -> float:
+    narrower = min(a.width, b.width)
+    if narrower <= 0:
+        return 0.0
+    return max(0.0, min(a.x1, b.x1) - max(a.x0, b.x0)) / narrower
+
+
+def covered_ratio(block: TextBlock, rect: fitz.Rect) -> float:
+    block_rect = fitz.Rect(block.rect)
+    area = block_rect.get_area()
+    if area <= 0:
+        return 0.0
+    return (block_rect & rect).get_area() / area
+
+
+def union_rect(rects: list[fitz.Rect]) -> fitz.Rect:
+    """数值求并。表线矩形高度为 0，PyMuPDF 的 |= 会把这种空矩形当无效值忽略掉。"""
+    return fitz.Rect(
+        min(rect.x0 for rect in rects),
+        min(rect.y0 for rect in rects),
+        max(rect.x1 for rect in rects),
+        max(rect.y1 for rect in rects),
+    )
+
+
+def rects_intersect(a: fitz.Rect, b: fitz.Rect) -> bool:
+    return a.x0 < b.x1 and b.x0 < a.x1 and a.y0 < b.y1 and b.y0 < a.y1
+
+
+def caption_between(upper: fitz.Rect, lower: fitz.Rect, captions: list[TextBlock]) -> bool:
+    """两条表线之间夹着表格标题，说明那里是另一张表，不能并成一组。"""
+    for caption in captions:
+        rect = fitz.Rect(caption.rect)
+        if rect.y0 >= upper.y1 - 1.0 and rect.y1 <= lower.y0 + 1.0 and horizontal_overlap_ratio(rect, lower) >= 0.3:
+            return True
+    return False
+
+
+def cluster_rules(rules: list[fitz.Rect], captions: list[TextBlock]) -> list[list[fitz.Rect]]:
+    """把同一张表的水平线归到一组：列区间对齐、行距不过大、中间没有新表标题。"""
+    groups: list[list[fitz.Rect]] = []
+    for rule in rules:
+        for group in groups:
+            last = group[-1]
+            if (
+                horizontal_overlap_ratio(last, rule) >= RULE_OVERLAP
+                and rule.y0 - last.y1 <= RULE_GAP
+                and not caption_between(last, rule, captions)
+            ):
+                group.append(rule)
+                break
+        else:
+            groups.append([rule])
+    return [group for group in groups if len(group) >= 2]
+
+
+def cluster_math_blocks(blocks: list[TextBlock]) -> list[list[TextBlock]]:
+    """把被 PDF 切碎的同一个公式合并成一组。"""
+    groups: list[list[TextBlock]] = []
+    for block in sorted(blocks, key=lambda item: (item.rect[1], item.rect[0])):
+        rect = fitz.Rect(block.rect)
+        for group in groups:
+            last = fitz.Rect(group[-1].rect)
+            if -1.0 <= rect.y0 - last.y1 <= MATH_CLUSTER_GAP and horizontal_overlap_ratio(last, rect) >= 0.5:
+                group.append(block)
+                break
+        else:
+            groups.append([block])
+    return groups
+
+
+def is_table_body_block(block: TextBlock, rect: fitz.Rect, rules: fitz.Rect) -> bool:
+    """表体单元格，或紧贴在末条表线下方、同一横向范围内的短表注。"""
+    if TABLE_CAPTION_RE.match(block.source_text):
+        return False
+    if covered_ratio(block, rect) >= REGION_COVERAGE:
+        return True
+    return (
+        len(block.source_text) <= 90
+        and rect.y1 - 1.0 <= block.rect[1] <= rect.y1 + 6.0
+        and block.rect[0] >= rules.x0 - 6.0
+        and block.rect[2] <= rules.x1 + 6.0
+    )
+
+
+def table_caption_label(page_blocks: list[TextBlock], rect: fitz.Rect) -> str | None:
+    for block in page_blocks:
+        if not TABLE_CAPTION_RE.match(block.source_text):
+            continue
+        block_rect = fitz.Rect(block.rect)
+        if block_rect.y1 <= rect.y0 + 1.0 and rect.y0 - block_rect.y1 <= 70.0:
+            if horizontal_overlap_ratio(block_rect, rect) >= 0.5:
+                return block.source_text[:24]
+    return None
+
+
+def detect_table_regions(page: fitz.Page, page_index: int, page_blocks: list[TextBlock]) -> list[PreservedRegion]:
+    captions = [block for block in page_blocks if TABLE_CAPTION_RE.match(block.source_text)]
+    regions: list[PreservedRegion] = []
+    for group in cluster_rules(horizontal_rules(page), captions):
+        rules = union_rect(group)
+        if rules.height <= 1.0 or rules.width < TABLE_MIN_WIDTH:
+            # 又矮又窄的一两条“表线”通常是公式里的分式线，不是表格。
+            continue
+        rect = fitz.Rect(rules)
+        for _ in range(6):
+            grown = fitz.Rect(rect)
+            for block in page_blocks:
+                if is_table_body_block(block, rect, rules):
+                    grown = union_rect([grown, fitz.Rect(block.rect)])
+            if grown == rect:
+                break
+            rect = grown
+        rect = fitz.Rect(rect.x0 - REGION_MARGIN, rect.y0, rect.x1 + REGION_MARGIN, rect.y1 + REGION_MARGIN)
+        if not any(covered_ratio(block, rect) >= REGION_COVERAGE for block in page_blocks):
+            # 只有几条短线、里面没有任何文字：多半是公式里的分式线，不是表格。
+            continue
+        label = table_caption_label(page_blocks, rect) or f"p{page_index + 1} 表格"
+        regions.append(PreservedRegion(page_index, (rect.x0, rect.y0, rect.x1, rect.y1), "table", label))
+    return regions
+
+
+def detect_formula_regions(page_index: int, page_blocks: list[TextBlock], skip: set[str]) -> list[PreservedRegion]:
+    candidates = [block for block in page_blocks if block.block_id not in skip]
+    regions: list[PreservedRegion] = []
+    for group in cluster_math_blocks([block for block in candidates if is_math_block(block)]):
+        group_ids = {block.block_id for block in group}
+        rect = union_rect([fitz.Rect(block.rect) for block in group])
+        rect = fitz.Rect(rect.x0 - 2, rect.y0 - 2, rect.x1 + 2, rect.y1 + 2)
+        touched = fitz.Rect(rect.x0 - 3, rect.y0 - 3, rect.x1 + 3, rect.y1 + 3)
+        for block in candidates:
+            if block.block_id in group_ids or is_block_translatable(block) or len(block.source_text) > 30:
+                continue
+            if rects_intersect(fitz.Rect(block.rect), touched):
+                rect = union_rect([rect, fitz.Rect(block.rect)])
+        # 被公式字体切成多块的段落，各行 bbox 会互相重叠：整块并进来，别只盖半行。
+        for _ in range(3):
+            grown = fitz.Rect(rect)
+            for block in candidates:
+                if block.block_id not in group_ids and covered_ratio(block, rect) >= 0.3:
+                    grown = union_rect([grown, fitz.Rect(block.rect)])
+            if grown == rect:
+                break
+            rect = grown
+        label = f"公式 {group[0].block_id}"
+        regions.append(PreservedRegion(page_index, (rect.x0, rect.y0, rect.x1, rect.y1), "formula", label))
+    return regions
+
+
+def merge_regions(regions: list[PreservedRegion]) -> list[PreservedRegion]:
+    """合并相交区域。并集可能又碰到别的区域，所以迭代到不再变化为止。"""
+    merged = list(regions)
+    while True:
+        result: list[PreservedRegion] = []
+        changed = False
+        for region in merged:
+            for index, existing in enumerate(result):
+                if existing.page_index != region.page_index:
+                    continue
+                if not rects_intersect(fitz.Rect(existing.rect), fitz.Rect(region.rect)):
+                    continue
+                kind = "table" if "table" in (existing.kind, region.kind) else "formula"
+                rect = union_rect([fitz.Rect(existing.rect), fitz.Rect(region.rect)])
+                label = existing.label if existing.kind == kind else region.label
+                result[index] = PreservedRegion(region.page_index, (rect.x0, rect.y0, rect.x1, rect.y1), kind, label)
+                changed = True
+                break
+            else:
+                result.append(region)
+        merged = result
+        if not changed:
+            return merged
+
+
+def detect_preserved_regions(doc: fitz.Document, blocks: list[TextBlock]) -> list[PreservedRegion]:
+    by_page: dict[int, list[TextBlock]] = {}
+    for block in blocks:
+        by_page.setdefault(block.page_index, []).append(block)
+    regions: list[PreservedRegion] = []
+    for page_index, page_blocks in sorted(by_page.items()):
+        page_regions = detect_table_regions(doc[page_index], page_index, page_blocks)
+        skip = preserved_block_ids(page_blocks, page_regions)
+        page_regions.extend(detect_formula_regions(page_index, page_blocks, skip))
+        regions.extend(merge_regions(page_regions))
+    return regions
+
+
+def region_for_block(block: TextBlock, regions: list[PreservedRegion]) -> PreservedRegion | None:
+    """块落在哪个保留区域里。表格标题不算，它要照常翻译。"""
+    if TABLE_CAPTION_RE.match(block.source_text):
+        return None
+    for region in regions:
+        if region.page_index == block.page_index and covered_ratio(block, fitz.Rect(region.rect)) >= REGION_COVERAGE:
+            return region
+    return None
+
+
+def preserved_block_ids(blocks: list[TextBlock], regions: list[PreservedRegion]) -> set[str]:
+    if not regions:
+        return set()
+    return {block.block_id for block in blocks if region_for_block(block, regions) is not None}
+
+
+def describe_regions(regions: list[PreservedRegion], blocks: list[TextBlock]) -> list[str]:
+    lines: list[str] = []
+    for region in regions:
+        covered = sum(1 for block in blocks if region_for_block(block, [region]) is not None)
+        box = ", ".join(f"{value:.0f}" for value in region.rect)
+        lines.append(f"第 {region.page_index + 1} 页 {region.kind} {region.label} [{box}] 覆盖 {covered} 个文本块")
+    return lines
 
 
 def parse_page_spec(spec: str | None, page_count: int) -> set[int] | None:
@@ -354,10 +645,14 @@ def prepare_translations(
     target_language: str,
     max_batch_chars: int,
     force: bool,
+    preserved: set[str],
 ) -> dict[str, str]:
     translated: dict[str, str] = {}
     pending: list[dict[str, str]] = []
     for block in blocks:
+        # 表格与公式区域保持原样，稍后由截图贴回，不走翻译接口。
+        if block.block_id in preserved:
+            continue
         if not is_block_translatable(block):
             translated[block.block_id] = block.source_text
             continue
@@ -436,26 +731,44 @@ def render_translated_pdf(
     translations: dict[str, str],
     *,
     font_override: str | None,
+    regions: list[PreservedRegion],
+    preserved: set[str],
+    region_dpi: int,
 ) -> dict[str, Any]:
     doc = fitz.open(source_path)
     try:
+        regions_by_page: dict[int, list[PreservedRegion]] = {}
+        for region in regions:
+            regions_by_page.setdefault(region.page_index, []).append(region)
         by_page: dict[int, list[TextBlock]] = {}
+        preserved_by_page: dict[int, list[TextBlock]] = {}
         for block in blocks:
-            # Keep formulas, identifiers, URLs, and symbol-only blocks exactly
-            # as authored in the PDF, including their original font styling.
-            if is_block_translatable(block):
+            if block.block_id in preserved:
+                # 区域内的原文会被截图盖回原样，但要先清掉文字层。
+                preserved_by_page.setdefault(block.page_index, []).append(block)
+            elif is_block_translatable(block):
+                # Keep formulas, identifiers, URLs, and symbol-only blocks exactly
+                # as authored in the PDF, including their original font styling.
                 by_page.setdefault(block.page_index, []).append(block)
         inserted = 0
         min_font_size = 100.0
-        for page_index, page_blocks_for_page in by_page.items():
+        for page_index in sorted(set(by_page) | set(preserved_by_page) | set(regions_by_page)):
             page = doc[page_index]
-            for block in page_blocks_for_page:
+            # 截图必须在遮罩之前取，否则取到的是空白。
+            pixmaps = [
+                (region.as_rect(), page.get_pixmap(clip=region.as_rect(), dpi=region_dpi))
+                for region in regions_by_page.get(page_index, [])
+            ]
+            page_blocks_for_page = by_page.get(page_index, [])
+            for block in preserved_by_page.get(page_index, []) + page_blocks_for_page:
                 page.add_redact_annot(fitz.Rect(block.rect), fill=(1, 1, 1))
             page.apply_redactions(
                 images=fitz.PDF_REDACT_IMAGE_NONE,
                 graphics=fitz.PDF_REDACT_LINE_ART_NONE,
                 text=fitz.PDF_REDACT_TEXT_REMOVE,
             )
+            for rect, pixmap in pixmaps:
+                page.insert_image(rect, pixmap=pixmap)
             for block in page_blocks_for_page:
                 fontfile = choose_font(font_override, block.bold)
                 size = insert_fitted_text(
@@ -474,7 +787,7 @@ def render_translated_pdf(
         doc.save(temp_path, garbage=4, deflate=True, clean=True)
         doc.close()
         temp_path.replace(output_path)
-        return {"blocks": inserted, "min_font_size": min_font_size}
+        return {"blocks": inserted, "regions": len(regions), "min_font_size": min_font_size}
     finally:
         if not doc.is_closed:
             doc.close()
@@ -494,6 +807,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--timeout", type=int, default=180, help="单次 API 请求超时秒数")
     parser.add_argument("--max-retries", type=int, default=4, help="请求失败重试次数")
     parser.add_argument("--max-batch-chars", type=int, default=8000, help="单个翻译批次的源文本字符上限")
+    parser.add_argument("--region-dpi", type=int, default=200, help="表格/公式截图的分辨率，默认 200")
+    parser.add_argument("--no-screenshot", action="store_true", help="关闭表格/公式截图，退回逐块替换文本")
     parser.add_argument("--overwrite", action="store_true", help="覆盖已有的译文 PDF；缓存仍然保留")
     parser.add_argument("--force", action="store_true", help="忽略已有翻译缓存，重新请求翻译")
     parser.add_argument("--dry-run", action="store_true", help="只检查 PDF 文本块，不请求 API、不生成 PDF")
@@ -531,7 +846,18 @@ def process_one(
             return
         count = sum(is_block_translatable(block) for block in blocks)
         chars = sum(len(block.source_text) for block in blocks)
+        regions: list[PreservedRegion] = []
+        if not args.no_screenshot:
+            regions = detect_preserved_regions(doc, blocks)
+        preserved = preserved_block_ids(blocks, regions)
+        count -= sum(1 for block in blocks if block.block_id in preserved)
+        chars -= sum(len(block.source_text) for block in blocks if block.block_id in preserved)
         LOGGER.info("页数=%d，文本块=%d，需要翻译=%d，字符数=%d", len(doc), len(blocks), count, chars)
+        if regions:
+            tables = sum(1 for region in regions if region.kind == "table")
+            LOGGER.info("保持原样的区域=%d（表格 %d，公式 %d），将以 %d dpi 截图贴回", len(regions), tables, len(regions) - tables, args.region_dpi)
+            for line in describe_regions(regions, blocks):
+                LOGGER.info("  %s", line)
         if args.dry_run:
             return
     finally:
@@ -549,9 +875,25 @@ def process_one(
         target_language=args.target_language,
         max_batch_chars=args.max_batch_chars,
         force=args.force,
+        preserved=preserved,
     )
-    result = render_translated_pdf(source_path, output_path, blocks, translations, font_override=args.font)
-    LOGGER.info("已生成: %s（替换 %d 个文本块，最小字号 %.1f）", output_path, result["blocks"], result["min_font_size"])
+    result = render_translated_pdf(
+        source_path,
+        output_path,
+        blocks,
+        translations,
+        font_override=args.font,
+        regions=regions,
+        preserved=preserved,
+        region_dpi=args.region_dpi,
+    )
+    LOGGER.info(
+        "已生成: %s（替换 %d 个文本块，截图 %d 处，最小字号 %.1f）",
+        output_path,
+        result["blocks"],
+        result["regions"],
+        result["min_font_size"],
+    )
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -3,6 +3,11 @@
 __pycache__/
 *.pyc
 
+# PyInstaller 打包产物（dist\翻译器.exe 由 build_exe.bat 现场生成）
+build/
+dist/
+*.spec
+
 # 生成的译文与翻译缓存（可重新生成；译文是原论文内容的派生，不进公开仓库）
 output/
 

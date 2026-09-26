@@ -18,7 +18,7 @@ import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 import fitz  # PyMuPDF
 
@@ -50,6 +50,10 @@ Return JSON only in this shape:
 
 class TranslationError(RuntimeError):
     pass
+
+
+class TranslationCancelled(RuntimeError):
+    """用户中途停止：已完成的批次都在缓存里，下次可接着跑。"""
 
 
 @dataclass(frozen=True)
@@ -647,6 +651,7 @@ def prepare_translations(
     max_batch_chars: int,
     force: bool,
     preserved: set[str],
+    should_stop: Callable[[], bool] | None = None,
 ) -> dict[str, str]:
     translated: dict[str, str] = {}
     pending: list[dict[str, str]] = []
@@ -669,6 +674,8 @@ def prepare_translations(
         batches = list(batch_items(pending, max_batch_chars))
         LOGGER.info("需要翻译 %d 个文本块，共 %d 个请求批次", len(pending), len(batches))
         for index, batch in enumerate(batches, start=1):
+            if should_stop is not None and should_stop():
+                raise TranslationCancelled(f"已停止：完成 {index - 1}/{len(batches)} 个批次，已翻译的部分留在缓存里")
             LOGGER.info("翻译批次 %d: %d 个文本块", index, len(batch))
             result = translator.translate_batch([{"id": x["id"], "text": x["text"]} for x in batch])
             for item in batch:
@@ -860,62 +867,121 @@ def discover_inputs(source_dir: Path, output_dir: Path, input_path: Path | None)
     )
 
 
-def process_one(
+@dataclass(frozen=True)
+class TranslationSettings:
+    """一次翻译任务的全部参数，命令行与图形界面共用。"""
+
+    target_language: str = "Simplified Chinese"
+    model: str = "gpt-4o-mini"
+    base_url: str = "https://api.openai.com/v1"
+    api_key: str = ""
+    timeout: int = 180
+    max_retries: int = 4
+    max_batch_chars: int = 8000
+    font: str | None = None
+    region_dpi: int = 200
+    screenshot: bool = True
+    pages: str | None = None
+    overwrite: bool = False
+    force: bool = False
+    dry_run: bool = False
+    mock: bool = False
+    cache_dir: Path | None = None
+
+
+def settings_from_args(args: argparse.Namespace) -> TranslationSettings:
+    return TranslationSettings(
+        target_language=args.target_language,
+        model=args.model,
+        base_url=args.base_url,
+        api_key=args.api_key,
+        timeout=args.timeout,
+        max_retries=args.max_retries,
+        max_batch_chars=args.max_batch_chars,
+        font=args.font,
+        region_dpi=args.region_dpi,
+        screenshot=not args.no_screenshot,
+        pages=args.pages,
+        overwrite=args.overwrite,
+        force=args.force,
+        dry_run=args.dry_run,
+        mock=args.mock,
+    )
+
+
+def translate_file(
     source_path: Path,
     output_dir: Path,
-    args: argparse.Namespace,
-    translator: OpenAICompatibleTranslator,
-) -> None:
+    settings: TranslationSettings,
+    *,
+    translator: OpenAICompatibleTranslator | None = None,
+    should_stop: Callable[[], bool] | None = None,
+) -> dict[str, Any]:
+    """翻译一个 PDF，译文写到 output_dir/<原名>.zh-CN.pdf。
+
+    返回 status: "done" | "skipped" | "empty" | "dry-run"。
+    should_stop 在批次之间被检查，返回真就抛 TranslationCancelled，
+    已完成的批次留在缓存里，下次接着跑。
+    """
+    if translator is None:
+        translator = OpenAICompatibleTranslator(
+            api_key=settings.api_key,
+            base_url=settings.base_url,
+            model=settings.model,
+            timeout=settings.timeout,
+            max_retries=settings.max_retries,
+            target_language=settings.target_language,
+            mock=settings.mock,
+        )
     LOGGER.info("处理: %s", source_path)
     doc = fitz.open(source_path)
     try:
-        selected_pages = parse_page_spec(args.pages, len(doc))
+        selected_pages = parse_page_spec(settings.pages, len(doc))
         blocks = list(iter_text_blocks(doc, selected_pages))
         if not blocks:
             LOGGER.warning("没有找到可提取的文本，可能是扫描版 PDF: %s", source_path.name)
-            return
-        count = sum(is_block_translatable(block) for block in blocks)
-        chars = sum(len(block.source_text) for block in blocks)
+            return {"status": "empty", "output": None}
         regions: list[PreservedRegion] = []
-        if not args.no_screenshot:
+        if settings.screenshot:
             regions = detect_preserved_regions(doc, blocks)
         preserved = preserved_block_ids(blocks, regions)
-        count -= sum(1 for block in blocks if block.block_id in preserved)
-        chars -= sum(len(block.source_text) for block in blocks if block.block_id in preserved)
+        count = sum(1 for block in blocks if block.block_id not in preserved and is_block_translatable(block))
+        chars = sum(len(block.source_text) for block in blocks if block.block_id not in preserved)
         LOGGER.info("页数=%d，文本块=%d，需要翻译=%d，字符数=%d", len(doc), len(blocks), count, chars)
         if regions:
             tables = sum(1 for region in regions if region.kind == "table")
-            LOGGER.info("保持原样的区域=%d（表格 %d，公式 %d），将以 %d dpi 截图贴回", len(regions), tables, len(regions) - tables, args.region_dpi)
+            LOGGER.info("保持原样的区域=%d（表格 %d，公式 %d），将以 %d dpi 截图贴回", len(regions), tables, len(regions) - tables, settings.region_dpi)
             for line in describe_regions(regions, blocks):
                 LOGGER.info("  %s", line)
-        if args.dry_run:
-            return
+        if settings.dry_run:
+            return {"status": "dry-run", "output": None}
     finally:
         doc.close()
 
     output_path = output_dir / f"{source_path.stem}.zh-CN.pdf"
-    if output_path.exists() and not args.overwrite:
+    if output_path.exists() and not settings.overwrite:
         LOGGER.info("输出已存在，跳过（使用 --overwrite 覆盖）: %s", output_path)
-        return
-    cache = JsonCache(output_dir / ".cache" / f"{source_path.stem}.json")
+        return {"status": "skipped", "output": output_path}
+    cache = JsonCache((settings.cache_dir or output_dir / ".cache") / f"{source_path.stem}.json")
     translations = prepare_translations(
         blocks,
         cache,
         translator,
-        target_language=args.target_language,
-        max_batch_chars=args.max_batch_chars,
-        force=args.force,
+        target_language=settings.target_language,
+        max_batch_chars=settings.max_batch_chars,
+        force=settings.force,
         preserved=preserved,
+        should_stop=should_stop,
     )
     result = render_translated_pdf(
         source_path,
         output_path,
         blocks,
         translations,
-        font_override=args.font,
+        font_override=settings.font,
         regions=regions,
         preserved=preserved,
-        region_dpi=args.region_dpi,
+        region_dpi=settings.region_dpi,
     )
     LOGGER.info(
         "已生成: %s（替换 %d 个文本块，截图 %d 处，最小字号 %.1f）",
@@ -924,6 +990,16 @@ def process_one(
         result["regions"],
         result["min_font_size"],
     )
+    return {"status": "done", "output": output_path, **result}
+
+
+def process_one(
+    source_path: Path,
+    output_dir: Path,
+    args: argparse.Namespace,
+    translator: OpenAICompatibleTranslator,
+) -> None:
+    translate_file(source_path, output_dir, settings_from_args(args), translator=translator)
 
 
 def main(argv: list[str] | None = None) -> int:

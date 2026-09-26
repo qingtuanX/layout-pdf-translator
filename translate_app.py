@@ -130,9 +130,11 @@ class TranslatorApp:
         self.messages: queue.Queue[tuple] = queue.Queue()
         self.stop_event = threading.Event()
         self.worker: threading.Thread | None = None
+        self.dnd_ready = False
         self._build_ui()
         self._install_log_handler()
         self.root.after(120, self._drain)
+        self._log(f"拖拽{'已就绪' if self.dnd_ready else '不可用（请用“选择文件”，或把 PDF 拖到 exe 图标上）'}")
         if initial:
             # 等窗口画出来再入队，免得缺密钥时设置窗先弹出来。
             self.root.after(300, lambda: self.enqueue(initial, autostart=True))
@@ -162,8 +164,11 @@ class TranslatorApp:
             try:
                 widget.drop_target_register(DND_FILES)
                 widget.dnd_bind("<<Drop>>", self._on_drop)
-            except Exception:  # noqa: BLE001 - 拖拽注册失败也不影响点选
+                self.dnd_ready = True
+            except Exception:  # noqa: BLE001 - 注册失败不影响点选，但要让用户看见
                 pass
+        if not self.dnd_ready:
+            label.configure(text=HINT + "\n（拖拽不可用：tkdnd 没加载成功，请用点选）")
 
     def _build_job_list(self) -> None:
         columns = ("file", "status", "output")

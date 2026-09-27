@@ -25,7 +25,7 @@ import fitz  # PyMuPDF
 
 
 LOGGER = logging.getLogger("pdf-translator")
-PROMPT_VERSION = "2026-09-26-v1"
+PROMPT_VERSION = "2026-09-26-v2-subsup"
 
 SYSTEM_PROMPT = r"""You are a careful technical-paper translator.
 Translate each supplied text block into the target language specified in the
@@ -43,6 +43,11 @@ Rules:
    layout. You may reflow those line breaks; the caller will lay the result out.
 6. If a block is only an equation, identifier, URL, email, citation, or number,
    return it unchanged.
+7. Text may contain the markers ⟦sup⟧…⟦/sup⟧ and ⟦sub⟧…⟦/sub⟧ around
+   superscripts and subscripts of formulas. Keep every marker exactly as it is:
+   same marker, same order, still wrapping the same symbol or letters. Never
+   drop, add, move or "fix" them, and do not translate what is inside ⟦sup⟧ or
+   ⟦sub⟧ unless it is a word that the surrounding text also needs translated.
 
 Return JSON only in this shape:
 {"translations":[{"id":"p1b0","text":"..."}]}
@@ -81,11 +86,20 @@ def clean_extracted_text(text: str) -> str:
     return " ".join(line for line in lines if line).strip()
 
 
+# 上下标判定：字号做门槛、基线定方向。实测 τ 抬升 +3.43、下缀 inflight 下沉 −2.92，
+# 而 m_d 的 d 只有 −1.44（0.15×字号 会漏掉它，0.10 才收得住）。
+SCRIPT_SIZE_RATIO = 0.85
+SCRIPT_OFFSET_RATIO = 0.10
+SUP_OPEN, SUP_CLOSE = "⟦sup⟧", "⟦/sup⟧"
+SUB_OPEN, SUB_CLOSE = "⟦sub⟧", "⟦/sub⟧"
+MARKER_RE = re.compile(r"⟦/?(?:sup|sub)⟧")
+
+
 def is_script_span(span: dict[str, Any], base_size: float) -> bool:
     """上下标碎片：PyMuPDF 标了上标（flags 的 bit0），或字号明显小于正文。"""
     if int(span.get("flags", 0)) & 1:
         return True
-    return float(span.get("size", base_size)) < base_size * 0.85
+    return float(span.get("size", base_size)) < base_size * SCRIPT_SIZE_RATIO
 
 
 def dominant_font_size(spans: list[dict[str, Any]]) -> float:
@@ -93,31 +107,67 @@ def dominant_font_size(spans: list[dict[str, Any]]) -> float:
     return sizes.most_common(1)[0][0] if sizes else 10.0
 
 
-def line_text(spans: list[dict[str, Any]], base_size: float) -> str:
-    """一行内的 span 拼接：有明显水平间距就补空格，但上下标碎片之间不补。
+def dominant_baseline(chars: list[tuple[dict[str, Any], dict[str, Any]]], base_size: float) -> float:
+    """该行的正文基线：正文号字符的 origin.y 均值。"""
+    values = [
+        float(char.get("origin", (0.0, 0.0))[1])
+        for char, span in chars
+        if abs(float(span.get("size", base_size)) - base_size) < 0.1
+    ]
+    return sum(values) / len(values) if values else 0.0
+
+
+def script_verdict(char: dict[str, Any], span: dict[str, Any], base_size: float, base_baseline: float) -> str | None:
+    """这个字符是上缀、下缀，还是正文。"""
+    if float(span.get("size", base_size)) >= base_size * SCRIPT_SIZE_RATIO:
+        return None
+    offset = base_baseline - float(char.get("origin", (0.0, base_baseline))[1])
+    if offset > SCRIPT_OFFSET_RATIO * base_size:
+        return "sup"
+    if offset < -SCRIPT_OFFSET_RATIO * base_size:
+        return "sub"
+    return None
+
+
+def line_text(line: dict[str, Any], base_size: float) -> str:
+    """一行的文字：span 之间按水平间距补空格，并按基线给上下标加标记。
 
     这些 PDF 里很多空格不是空格字符、只是位置间隔，直接拼接会把单词粘成
-    "DisaggregatedLLMinference"；反过来公式里的上下标又不能被塞进空格。
+    "DisaggregatedLLMinference"；反过来公式里的上下标既不能被塞进空格，还得
+    标出来，好让渲染层还原成真正的 <sub>/<sup>。
     """
+    spans = [span for span in line.get("spans", []) if str(span.get("text", ""))]
+    if not spans:
+        return ""
+    chars = [(char, span) for span in spans for char in span.get("chars", [])]
+    base_baseline = dominant_baseline(chars, base_size)
     text = ""
+    state: str | None = None
     previous: dict[str, Any] | None = None
     for span in spans:
-        piece = str(span.get("text", ""))
-        if not piece:
-            continue
         if previous is not None:
             gap = float(span["bbox"][0]) - float(previous["bbox"][2])
             size = min(float(span.get("size", base_size)), float(previous.get("size", base_size)))
             if (
                 gap > 0.25 * size
                 and not text.endswith(" ")
-                and not piece.startswith(" ")
+                and not str(span.get("text", "")).startswith(" ")
                 and not is_script_span(span, base_size)
                 and not is_script_span(previous, base_size)
             ):
                 text += " "
-        text += piece
+        for char in span.get("chars", []):
+            verdict = script_verdict(char, span, base_size, base_baseline)
+            if verdict != state:
+                if state is not None:
+                    text += SUP_CLOSE if state == "sup" else SUB_CLOSE
+                if verdict is not None:
+                    text += SUP_OPEN if verdict == "sup" else SUB_OPEN
+                state = verdict
+            text += str(char.get("c", ""))
         previous = span
+    if state is not None:
+        text += SUP_CLOSE if state == "sup" else SUB_CLOSE
     return text
 
 
@@ -131,7 +181,7 @@ def block_source_text(lines: list[dict[str, Any]], base_size: float) -> str:
         spans = [span for span in line.get("spans", []) if str(span.get("text", ""))]
         if not spans:
             continue
-        text = line_text(spans, base_size)
+        text = line_text(line, base_size)
         if parts and not is_script_span(spans[0], base_size):
             text = " " + text
         parts.append(text)
@@ -140,6 +190,7 @@ def block_source_text(lines: list[dict[str, Any]], base_size: float) -> str:
 
 def is_translatable(text: str) -> bool:
     """Skip blocks that are clearly only punctuation, numbers, or symbols."""
+    text = MARKER_RE.sub("", text)  # 上下标标记不算内容
     if len(text.strip()) < 2 or not re.search(r"[A-Za-z\u3400-\u9fff]", text):
         return False
     if re.search(r"\b(?:Abstract|Introduction|Background|Conclusion|Table|Figure|Fig\.|Section|Appendix|References)\b", text, re.I):
@@ -181,11 +232,16 @@ def iter_text_blocks(doc: fitz.Document, selected_pages: set[int] | None = None)
     for page_index, page in enumerate(doc):
         if selected_pages is not None and page_index not in selected_pages:
             continue
-        page_dict = page.get_text("dict", flags=fitz.TEXTFLAGS_TEXT)
+        # rawdict 才带每个字符的 origin（基线点），判上下缀要用它。
+        page_dict = page.get_text("rawdict", flags=fitz.TEXTFLAGS_TEXT)
         for block_index, block in enumerate(page_dict.get("blocks", [])):
             if block.get("type") != 0:
                 continue
             lines = block.get("lines", [])
+            for line in lines:
+                for span in line.get("spans", []):
+                    # rawdict 的 span 不带 text，按字符补出来，后面逻辑照旧。
+                    span["text"] = "".join(char.get("c", "") for char in span.get("chars", []))
             spans = [span for line in lines for span in line.get("spans", []) if span.get("text", "").strip()]
             source_text = block_source_text(lines, dominant_font_size(spans))
             if not source_text:
@@ -265,7 +321,7 @@ def math_char_ratio(spans: list[dict[str, Any]]) -> float:
 
 def is_math_block(block: TextBlock) -> bool:
     """判断一个块是不是（基本）只由公式构成。散文段落一律排除。"""
-    text = block.source_text
+    text = MARKER_RE.sub("", block.source_text)  # 标记里的 sub/sup 字母不算内容
     words = re.findall(r"[A-Za-z]{2,}", text)
     if len(text) > 160 or len(words) >= 8:
         return False
@@ -573,6 +629,18 @@ def parse_json_response(content: str) -> dict[str, Any]:
     return parsed
 
 
+def collect_translations(translations: list[Any], expected_ids: set[str]) -> dict[str, str]:
+    """从接口返回的 translations 数组里挑出我们认识的 id。"""
+    collected: dict[str, str] = {}
+    for item in translations:
+        if not isinstance(item, dict):
+            continue
+        item_id, text = str(item.get("id", "")), item.get("text")
+        if item_id in expected_ids and isinstance(text, str):
+            collected[item_id] = text.strip()
+    return collected
+
+
 class OpenAICompatibleTranslator:
     def __init__(
         self,
@@ -631,17 +699,25 @@ class OpenAICompatibleTranslator:
         translations = parsed.get("translations")
         if not isinstance(translations, list):
             raise TranslationError("翻译接口返回的 JSON 缺少 translations 数组")
-        result: dict[str, str] = {}
         expected_ids = {item["id"] for item in items}
-        for item in translations:
-            if not isinstance(item, dict):
-                continue
-            item_id, text = str(item.get("id", "")), item.get("text")
-            if item_id in expected_ids and isinstance(text, str):
-                result[item_id] = text.strip()
+        result = collect_translations(translations, expected_ids)
         missing = expected_ids - result.keys()
         if missing:
-            raise TranslationError(f"翻译接口漏返回文本块: {', '.join(sorted(missing))}")
+            # 模型偶尔会漏一两个 id，只补请求漏掉的那几个，别让整个文件失败。
+            LOGGER.warning("翻译接口漏返回 %d 个文本块，单独补一次: %s", len(missing), ", ".join(sorted(missing)))
+            payload["messages"][-1] = {
+                "role": "user",
+                "content": json.dumps(
+                    {"target_language": self.target_language, "items": [item for item in items if item["id"] in missing]},
+                    ensure_ascii=False,
+                ),
+            }
+            retry = parse_json_response(self._request(payload)).get("translations")
+            if isinstance(retry, list):
+                result.update(collect_translations(retry, expected_ids))
+            missing = expected_ids - result.keys()
+            if missing:
+                raise TranslationError(f"翻译接口漏返回文本块: {', '.join(sorted(missing))}")
         return result
 
     def _request(self, payload: dict[str, Any]) -> str:
@@ -699,6 +775,24 @@ def batch_items(items: list[dict[str, str]], max_chars: int) -> Iterator[list[di
         yield batch
 
 
+def check_markers(source: str, translated: str, block_id: str) -> str:
+    """模型必须把上下标标记原样带回来；数量不对就退回纯文本，别把排版搞坏。"""
+    if not MARKER_RE.search(source):
+        return MARKER_RE.sub("", translated)
+    counts = [
+        (token, source.count(token), translated.count(token))
+        for token in (SUP_OPEN, SUP_CLOSE, SUB_OPEN, SUB_CLOSE)
+    ]
+    if all(want == got for _token, want, got in counts):
+        return translated
+    LOGGER.warning(
+        "文本块 %s 的上下标标记没被完整保留（%s），该块按纯文本写入",
+        block_id,
+        ", ".join(f"{token}:{want}->{got}" for token, want, got in counts if want != got),
+    )
+    return MARKER_RE.sub("", translated)
+
+
 def prepare_translations(
     blocks: list[TextBlock],
     cache: JsonCache,
@@ -736,7 +830,7 @@ def prepare_translations(
             LOGGER.info("翻译批次 %d: %d 个文本块", index, len(batch))
             result = translator.translate_batch([{"id": x["id"], "text": x["text"]} for x in batch])
             for item in batch:
-                value = result[item["id"]]
+                value = check_markers(item["text"], result[item["id"]], item["id"])
                 translated[item["id"]] = value
                 cache.put(item["_cache_key"], value)
             cache.save()
@@ -763,7 +857,20 @@ def html_css(fontfile: str, size: float, color: tuple[float, float, float], alig
     return (
         f"* {{font-family:'cjkfont'; font-size:{size:.2f}px; line-height:1.12;"
         f" text-align:{TEXT_ALIGN_NAMES.get(align, 'left')}; color:#{red:02x}{green:02x}{blue:02x};}}"
+        f" sub {{font-size:0.70em; vertical-align:sub;}}"
+        f" sup {{font-size:0.70em; vertical-align:super;}}"
         f" @font-face {{font-family:'cjkfont'; src:url('{Path(fontfile).name}');}}"
+    )
+
+
+def to_html(text: str) -> str:
+    """转义后把上下标标记换成真标签 —— 顺序不能反，否则标签本身会被转义成文本。"""
+    escaped = html.escape(text.translate(RENDER_SUBSTITUTIONS))
+    return (
+        escaped.replace(SUB_OPEN, "<sub>")
+        .replace(SUB_CLOSE, "</sub>")
+        .replace(SUP_OPEN, "<sup>")
+        .replace(SUP_CLOSE, "</sup>")
     )
 
 
@@ -780,7 +887,7 @@ def insert_html(
 ) -> tuple[float, float]:
     return page.insert_htmlbox(
         target,
-        html.escape(text.translate(RENDER_SUBSTITUTIONS)),
+        to_html(text),
         css=html_css(fontfile, size, color, align),
         archive=font_archive(fontfile),
         scale_low=scale_low,
